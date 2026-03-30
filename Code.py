@@ -102,7 +102,7 @@ def main():
     identifier_columns = ["name", "element"]
     target_columns = [
         "h", "c", "n", "f", "cl", "s", "co2", "cho", "co", "cooh",
-        "n2", "n2h", "no", "noh", "oh", "ooh", "o2", "h2o"
+        "n2", "n2h", "no", "noh", "oh", "o2", "h2o"
     ]
     feature_columns = [col for col in data.columns if col not in identifier_columns + target_columns]
     X_all = data[feature_columns].values
