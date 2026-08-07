@@ -1,216 +1,391 @@
-import os
+# -*- coding: utf-8 -*-
+"""Machine-learning workflow for lanthanide SAC adsorption-energy prediction."""
+
+from __future__ import annotations
+
 import argparse
-import pandas as pd
+import math
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr, spearmanr
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
-from sklearn.svm import SVR
-from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import LeaveOneOut
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from xgboost import XGBRegressor
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVR
+
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGBRegressor = None
+
+RANDOM_STATE = 42
+
+# Adsorption intermediates listed in the manuscript.
+TARGETS = [
+    "o", "oh", "h2o", "c", "co2", "cho", "co", "cooh",
+    "n", "n2", "n2h", "no", "noh", "h", "f", "s",
+]
+
+# Lanthanide descriptors.
+ATOMIC_NUMBER = {
+    "la": 57, "ce": 58, "pr": 59, "nd": 60, "sm": 62, "eu": 63,
+    "gd": 64, "tb": 65, "dy": 66, "ho": 67, "er": 68, "tm": 69,
+    "yb": 70, "lu": 71,
+}
+
+F_OCCUPANCY = {
+    "la": 0, "ce": 1, "pr": 2, "nd": 3, "sm": 5, "eu": 6,
+    "gd": 7, "tb": 8, "dy": 9, "ho": 10, "er": 11, "tm": 12,
+    "yb": 13, "lu": 14,
+}
+
+MODEL_NAMES = [
+    "ridge",
+    "random_forest",
+    "xgboost",
+    "svr",
+    "hist_gradient_boosting",
+]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Leave-one-out model selection and missing-value imputation for multi-target tabular data."
+        description="LOO model evaluation and prediction for lanthanide SAC adsorption energies."
+    )
+    parser.add_argument("--input-file", required=True, help="Input CSV file.")
+    parser.add_argument("--output-dir", required=True, help="Output directory.")
+    parser.add_argument(
+        "--feature-set",
+        choices=["results", "methods"],
+        default="results",
+        help=(
+            "results: atomic number + substrate configuration + 4f occupancy + atomic radius; "
+            "methods: atomic number + binding energy + bonding length + atomic radius."
+        ),
     )
     parser.add_argument(
-        "--input-file",
-        type=str,
-        required=True,
-        help="Path to the input CSV file."
+        "--descriptor-file",
+        default=None,
+        help="CSV containing element and atomic_radius; atomic_number/f_occupancy may also be supplied.",
     )
     parser.add_argument(
-        "--output-file",
-        type=str,
-        required=True,
-        help="Path to the output CSV file for the imputed dataset."
+        "--bond-length-column",
+        default="bond_length",
+        help="Bonding-length column used with --feature-set methods.",
     )
+    parser.add_argument(
+        "--dft-mask-file",
+        default=None,
+        help="Optional CSV with columns name,target,is_dft for completed datasets.",
+    )
+    parser.add_argument(
+        "--adsorbate-reference-file",
+        default=None,
+        help="Optional CSV with columns target,adsorbate_energy_eV.",
+    )
+    parser.add_argument("--min-known", type=int, default=6)
     return parser.parse_args()
 
 
-def create_model(model_name):
-    if model_name == "ridge":
-        return Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=1.0))
-        ])
-    elif model_name == "random_forest":
-        return RandomForestRegressor(
-            n_estimators=100,
-            random_state=42
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip().lower() for c in out.columns]
+    return out
+
+
+def add_descriptors(data: pd.DataFrame, descriptor_file: str | None) -> pd.DataFrame:
+    data = data.copy()
+    data["element"] = data["element"].astype(str).str.lower().str.strip()
+
+    if "atomic_number" not in data.columns:
+        data["atomic_number"] = data["element"].map(ATOMIC_NUMBER)
+    if "f_occupancy" not in data.columns:
+        data["f_occupancy"] = data["element"].map(F_OCCUPANCY)
+
+    if descriptor_file:
+        desc = normalize_columns(pd.read_csv(descriptor_file))
+        if "element" not in desc.columns or "atomic_radius" not in desc.columns:
+            raise ValueError("descriptor-file must contain element and atomic_radius columns.")
+        desc["element"] = desc["element"].astype(str).str.lower().str.strip()
+        keep = [
+            c for c in ["element", "atomic_number", "f_occupancy", "atomic_radius"]
+            if c in desc.columns
+        ]
+        base = data.drop(columns=[c for c in keep if c != "element" and c in data.columns])
+        data = base.merge(desc[keep].drop_duplicates("element"), on="element", how="left")
+
+    required = ["atomic_number", "f_occupancy", "atomic_radius"]
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        raise ValueError(f"Missing descriptor columns: {missing}")
+    if data[required].isna().any().any():
+        raise ValueError("Some lanthanide descriptor values are missing.")
+    return data
+
+
+def load_dft_mask(mask_file: str, data: pd.DataFrame, target: str) -> np.ndarray:
+    mask = normalize_columns(pd.read_csv(mask_file))
+    required = {"name", "target", "is_dft"}
+    if not required.issubset(mask.columns):
+        raise ValueError("dft-mask-file must contain name,target,is_dft columns.")
+
+    selected = mask[
+        mask["target"].astype(str).str.lower().str.strip().eq(target)
+        & mask["is_dft"].astype(bool)
+    ]
+    known_names = set(selected["name"].astype(str))
+    return data["name"].astype(str).isin(known_names).to_numpy()
+
+
+def known_mask(data: pd.DataFrame, target: str, mask_file: str | None) -> np.ndarray:
+    if mask_file:
+        return load_dft_mask(mask_file, data, target) & data[target].notna().to_numpy()
+
+    mask = data[target].notna().to_numpy()
+    if mask.all():
+        raise ValueError(
+            f"Target '{target}' has no missing entries. Provide --dft-mask-file to identify DFT-calculated samples."
         )
-    elif model_name == "xgboost":
-        return XGBRegressor(
-            n_estimators=200,
-            learning_rate=0.1,
-            random_state=42
-        )
-    elif model_name == "svr":
-        return Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", SVR(C=10, kernel="rbf"))
-        ])
-    elif model_name == "mlp":
-        return Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", MLPRegressor(
-                hidden_layer_sizes=(100, 50),
-                max_iter=1000,
-                random_state=42
-            ))
-        ])
-    elif model_name == "hist_gradient_boosting":
-        return HistGradientBoostingRegressor(
-            random_state=42
-        )
+    return mask
+
+
+def load_adsorbate_references(path: str | None) -> dict[str, float]:
+    if not path:
+        return {}
+    refs = normalize_columns(pd.read_csv(path))
+    required = {"target", "adsorbate_energy_ev"}
+    if not required.issubset(refs.columns):
+        raise ValueError("adsorbate-reference-file must contain target,adsorbate_energy_eV columns.")
+    return {
+        str(row["target"]).lower().strip(): float(row["adsorbate_energy_ev"])
+        for _, row in refs.iterrows()
+    }
+
+
+def feature_columns(data: pd.DataFrame, feature_set: str, bond_length_column: str):
+    if feature_set == "results":
+        numeric = ["atomic_number", "f_occupancy", "atomic_radius"]
+        categorical = ["base_type"]
     else:
-        raise ValueError(f"Unknown model name: {model_name}")
+        numeric = ["atomic_number", "binding_energy", bond_length_column, "atomic_radius"]
+        categorical = []
+
+    missing = [c for c in numeric + categorical if c not in data.columns]
+    if missing:
+        raise ValueError(f"Missing feature columns: {missing}")
+    return numeric, categorical
 
 
-def evaluate_model(model, X, y, loo):
-    y_true_all = []
-    y_pred_all = []
+def make_preprocessor(numeric, categorical, scale_numeric: bool):
+    transformers = []
+    if numeric:
+        transformers.append(
+            ("num", StandardScaler() if scale_numeric else "passthrough", numeric)
+        )
+    if categorical:
+        transformers.append(
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical)
+        )
+    return ColumnTransformer(transformers, remainder="drop")
+
+
+# Model settings used for comparison.
+def create_model(name: str, numeric, categorical):
+    if name == "ridge":
+        return Pipeline([
+            ("pre", make_preprocessor(numeric, categorical, True)),
+            ("model", Ridge(alpha=1.0)),
+        ])
+    if name == "random_forest":
+        return Pipeline([
+            ("pre", make_preprocessor(numeric, categorical, False)),
+            ("model", RandomForestRegressor(n_estimators=100, random_state=RANDOM_STATE)),
+        ])
+    if name == "xgboost":
+        if XGBRegressor is None:
+            raise RuntimeError("xgboost is not installed.")
+        return Pipeline([
+            ("pre", make_preprocessor(numeric, categorical, False)),
+            ("model", XGBRegressor(
+                n_estimators=200,
+                learning_rate=0.1,
+                random_state=RANDOM_STATE,
+                n_jobs=1,
+                verbosity=0,
+            )),
+        ])
+    if name == "svr":
+        return Pipeline([
+            ("pre", make_preprocessor(numeric, categorical, True)),
+            ("model", SVR(C=10, kernel="rbf")),
+        ])
+    if name == "hist_gradient_boosting":
+        return Pipeline([
+            ("pre", make_preprocessor(numeric, categorical, False)),
+            ("model", HistGradientBoostingRegressor(random_state=RANDOM_STATE)),
+        ])
+    raise ValueError(name)
+
+
+def build_target(data: pd.DataFrame, target: str, adsorbate_refs: dict[str, float]) -> np.ndarray:
+    # Adsorption-energy target.
+    y = data[target].astype(float) - data["re_atom_energy"].astype(float) - data["base_c"].astype(float)
+    if target in adsorbate_refs:
+        y = y - adsorbate_refs[target]
+    return y.to_numpy(float)
+
+
+def safe_corr(func, y_true, y_pred):
+    try:
+        return float(func(y_true, y_pred).statistic)
+    except Exception:
+        return np.nan
+
+
+def evaluate_model(model_name, X, y, numeric, categorical):
+    # Leave-one-out cross-validation.
+    loo = LeaveOneOut()
+    pred = np.full(len(y), np.nan, dtype=float)
 
     for train_idx, test_idx in loo.split(X):
-        model.fit(X[train_idx], y[train_idx])
-        y_pred = model.predict(X[test_idx])
-        y_true_all.append(y[test_idx][0])
-        y_pred_all.append(y_pred[0])
+        model = create_model(model_name, numeric, categorical)
+        model.fit(X.iloc[train_idx], y[train_idx])
+        pred[test_idx] = model.predict(X.iloc[test_idx])
 
-    y_true_all = np.array(y_true_all)
-    y_pred_all = np.array(y_pred_all)
-
-    mse = mean_squared_error(y_true_all, y_pred_all)
-    mae = mean_absolute_error(y_true_all, y_pred_all)
-    r2 = r2_score(y_true_all, y_pred_all)
-
-    return mse, r2, mae
+    mse = mean_squared_error(y, pred)
+    metrics = {
+        "r2": float(r2_score(y, pred)),
+        "mse_eV2": float(mse),
+        "rmse_eV": float(math.sqrt(mse)),
+        "mae_eV": float(mean_absolute_error(y, pred)),
+        "pearson_r": safe_corr(pearsonr, y, pred),
+        "spearman_rho": safe_corr(spearmanr, y, pred),
+    }
+    return pred, metrics
 
 
 def main():
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_file = args.input_file
-    output_file = args.output_file
+    data = normalize_columns(pd.read_csv(args.input_file))
+    required_source = ["name", "element", "base_c", "re_atom_energy", "binding_energy"]
+    missing_source = [c for c in required_source if c not in data.columns]
+    if missing_source:
+        raise ValueError(f"Missing source columns: {missing_source}")
 
-    data = pd.read_csv(input_file)
+    data = add_descriptors(data, args.descriptor_file)
+    adsorbate_refs = load_adsorbate_references(args.adsorbate_reference_file)
+    numeric, categorical = feature_columns(
+        data, args.feature_set, args.bond_length_column.lower()
+    )
+    features = numeric + categorical
 
-    identifier_columns = ["name", "element"]
-    target_columns = [
-        "h", "c", "n", "f", "cl", "s", "co2", "cho", "co", "cooh",
-        "n2", "n2h", "no", "noh", "oh", "o2", "h2o"
-    ]
-    feature_columns = [col for col in data.columns if col not in identifier_columns + target_columns]
-    X_all = data[feature_columns].values
+    metric_rows = []
+    prediction_rows = []
+    best_rows = []
+    completed = data.copy()
 
-    loo = LeaveOneOut()
-
-    all_model_results = []
-    best_model_results = []
-
-    candidate_models = [
-        "ridge",
-        "random_forest",
-        "xgboost",
-        "svr",
-        "mlp",
-        "hist_gradient_boosting"
-    ]
-
-    for target in target_columns:
-        print(f"\\nProcessing target: {target}")
-
-        y = data[target].values
-        missing_mask = np.isnan(y)
-        known_mask = ~missing_mask
-
-        X_known = X_all[known_mask]
-        y_known = y[known_mask]
-        X_missing = X_all[missing_mask]
-
-        if len(y_known) < 2:
-            print(f"Skipping {target}: insufficient samples.")
+    for target in TARGETS:
+        if target not in data.columns:
             continue
 
+        is_known = known_mask(data, target, args.dft_mask_file)
+        n_known = int(is_known.sum())
+        if n_known < args.min_known:
+            continue
+
+        known = data.loc[is_known].copy()
+        X_known = known[features].copy()
+        y_known = build_target(known, target, adsorbate_refs)
+
+        best_name = None
         best_r2 = -np.inf
-        best_model_name = None
-        best_model = None
-        best_mse = None
-        best_mae = None
+        best_metrics = None
 
-        for model_name in candidate_models:
-            model = create_model(model_name)
+        for model_name in MODEL_NAMES:
             try:
-                mse, r2, mae = evaluate_model(model, X_known, y_known, loo)
-                print(f"  Model {model_name} - R2: {r2:.4f}, MSE: {mse:.4f}, MAE: {mae:.4f}")
-
-                all_model_results.append({
+                pred, metrics = evaluate_model(
+                    model_name, X_known, y_known, numeric, categorical
+                )
+            except Exception as exc:
+                metric_rows.append({
                     "target": target,
                     "model": model_name,
-                    "r2": r2,
-                    "mse": mse,
-                    "mae": mae
+                    "n_dft": n_known,
+                    "error": str(exc),
                 })
+                continue
 
-                if not np.isnan(r2) and r2 > best_r2:
-                    best_r2 = r2
-                    best_model_name = model_name
-                    best_model = model
-                    best_mse = mse
-                    best_mae = mae
+            metric_rows.append({
+                "target": target,
+                "model": model_name,
+                "n_dft": n_known,
+                **metrics,
+            })
 
-            except Exception as e:
-                print(f"Model {model_name} failed on target {target}: {e}")
-                all_model_results.append({
+            for (_, row), y_true, y_pred in zip(known.iterrows(), y_known, pred):
+                prediction_rows.append({
                     "target": target,
                     "model": model_name,
-                    "r2": np.nan,
-                    "mse": np.nan,
-                    "mae": np.nan
+                    "name": row["name"],
+                    "element": row["element"],
+                    "y_true_eV": float(y_true),
+                    "y_pred_eV": float(y_pred),
+                    "residual_eV": float(y_pred - y_true),
                 })
 
-        if best_model is None:
-            print(f"All models failed on target {target}. Skipping imputation.")
+            if np.isfinite(metrics["r2"]) and metrics["r2"] > best_r2:
+                best_r2 = metrics["r2"]
+                best_name = model_name
+                best_metrics = metrics
+
+        if best_name is None:
             continue
 
-        print(f"Selected model for {target}: {best_model_name}, R2 = {best_r2:.4f}")
-
-        best_model.fit(X_known, y_known)
-
-        if len(X_missing) > 0:
-            y_pred_missing = best_model.predict(X_missing)
-            data.loc[missing_mask, target] = y_pred_missing
-
-        best_model_results.append({
+        best_rows.append({
             "target": target,
-            "best_model": best_model_name,
-            "best_r2": best_r2,
-            "best_mse": best_mse,
-            "best_mae": best_mae,
-            "n_known": len(y_known),
-            "n_missing": int(np.sum(missing_mask))
+            "best_model": best_name,
+            "n_dft": n_known,
+            **best_metrics,
         })
 
-    output_dir = os.path.dirname(output_file)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        # Fit the selected model on all DFT-known samples and predict the remaining entries.
+        model = create_model(best_name, numeric, categorical)
+        model.fit(X_known, y_known)
+        to_predict = ~is_known
 
-    data.to_csv(output_file, index=False)
+        if to_predict.any():
+            X_pred = data.loc[to_predict, features].copy()
+            y_pred = model.predict(X_pred)
+            ref = adsorbate_refs.get(target, 0.0)
+            total_pred = (
+                y_pred
+                + data.loc[to_predict, "re_atom_energy"].to_numpy(float)
+                + data.loc[to_predict, "base_c"].to_numpy(float)
+                + ref
+            )
+            completed.loc[to_predict, target] = total_pred
 
-    base_name = os.path.splitext(output_file)[0]
-    all_results_file = f"{base_name}_all_model_results.csv"
-    best_results_file = f"{base_name}_best_model_summary.csv"
+    # Save the completed dataset and model-evaluation tables.
+    pd.DataFrame(metric_rows).to_csv(output_dir / "all_model_metrics.csv", index=False)
+    pd.DataFrame(best_rows).to_csv(output_dir / "best_model_summary.csv", index=False)
+    pd.DataFrame(prediction_rows).to_csv(output_dir / "loo_predictions.csv", index=False)
+    completed.to_csv(output_dir / "predicted_dataset.csv", index=False)
 
-    pd.DataFrame(all_model_results).to_csv(all_results_file, index=False)
-    pd.DataFrame(best_model_results).to_csv(best_results_file, index=False)
+    if best_rows:
+        summary = pd.DataFrame(best_rows)
+        columns = ["target", "best_model", "n_dft", "r2", "rmse_eV", "mae_eV", "pearson_r"]
+        print(summary[columns].to_string(index=False))
 
-    print(f"\\nImputed dataset saved to: {output_file}")
-    print(f"All model evaluation results saved to: {all_results_file}")
-    print(f"Best model summary saved to: {best_results_file}")
+    print(f"\nResults saved to: {output_dir}")
 
 
 if __name__ == "__main__":
